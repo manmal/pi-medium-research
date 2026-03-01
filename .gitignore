@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+output/
+_media/
+blog.html
+blog.md
+temp_blog.md

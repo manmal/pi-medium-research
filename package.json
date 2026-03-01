@@ -1,0 +1,34 @@
+{
+  "name": "pi-medium-research",
+  "version": "0.2.0",
+  "description": "pi extension: find and read Medium articles via mirror (Freedium) with terminal-friendly output",
+  "keywords": ["pi-package", "pi-extension", "medium", "freedium"],
+  "license": "MIT",
+  "author": "Harmeet Randhawa",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Soorma718/pi-medium-research"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "node --import tsx --test tests/**/*.test.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "fast-xml-parser": "^4.5.3",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
