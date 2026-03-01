@@ -115,6 +115,135 @@ export function extractSnippetFromRssDescription(descriptionHtml: string): strin
 	}
 }
 
+export type RssQueryMode = "rss_tag" | "rss_author" | "rss_publication";
+
+export interface ParsedRssQuery {
+	mode: RssQueryMode;
+	value: string;
+}
+
+export function parseRssQuery(query: string): ParsedRssQuery | undefined {
+	const q = query.trim();
+	if (!q) return undefined;
+
+	const tagMatch = q.match(/(?:^|\s)tag:([\w-]+)/i);
+	if (tagMatch?.[1]) return { mode: "rss_tag", value: tagMatch[1] };
+
+	const authorMatch = q.match(/(?:^|\s)author:@?([\w-]+)/i);
+	if (authorMatch?.[1]) return { mode: "rss_author", value: authorMatch[1] };
+
+	const pubMatch = q.match(/(?:^|\s)pub:([\w-]+)/i);
+	if (pubMatch?.[1]) return { mode: "rss_publication", value: pubMatch[1] };
+
+	return undefined;
+}
+
+export function extractRssFallbackTags(query: string, limit = 3): string[] {
+	const stopWords = new Set(["site", "medium", "com", "www", "http", "https"]);
+	const tokens = (query.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) ?? []).filter(
+		(token) => !stopWords.has(token)
+	);
+
+	const deduped: string[] = [];
+	for (const token of tokens) {
+		if (deduped.includes(token)) continue;
+		deduped.push(token);
+		if (deduped.length >= Math.max(1, limit)) break;
+	}
+	return deduped;
+}
+
+export function isWebSearchErrorRetryable(error: unknown): boolean {
+	const message = String((error as any)?.message ?? error).toLowerCase();
+	if (!message) return false;
+	if (message.includes("abort")) return false;
+	if (message.includes("api key not found")) return false;
+	if (message.includes("no search provider available")) return false;
+	if (message.includes("gemini search unavailable")) return false;
+
+	return (
+		message.includes("timeout") ||
+		message.includes("timed out") ||
+		message.includes("network") ||
+		message.includes("fetch failed") ||
+		message.includes("econn") ||
+		message.includes("rate limited") ||
+		message.includes(" 429") ||
+		message.includes(" 500") ||
+		message.includes(" 502") ||
+		message.includes(" 503") ||
+		message.includes("temporar")
+	);
+}
+
+export async function runWebSearchWithRssTagFallback<T>(params: {
+	query: string;
+	runWebSearch: () => Promise<T[]>;
+	runRssTagSearch: (tag: string) => Promise<T[]>;
+	logWarn?: (message: string) => void;
+}): Promise<T[]> {
+	try {
+		return await params.runWebSearch();
+	} catch (e) {
+		const message = String((e as any)?.message ?? e);
+		params.logWarn?.(
+			`[medium-research] Web search unavailable; trying RSS tag fallback. ${message.slice(0, 160)}`
+		);
+	}
+
+	for (const tag of extractRssFallbackTags(params.query)) {
+		try {
+			const rssResults = await params.runRssTagSearch(tag);
+			if (rssResults.length > 0) return rssResults;
+		} catch {
+			// keep trying next candidate tag
+		}
+	}
+
+	return [];
+}
+
+export interface WebSearchResultCandidate {
+	title?: string;
+	url?: string;
+	snippet?: string;
+	text?: string;
+	highlights?: string[];
+	publishedAt?: string;
+	publishedDate?: string;
+}
+
+export interface NormalizedWebSearchResult {
+	title: string;
+	url: string;
+	snippet?: string;
+	publishedAt?: string;
+}
+
+export function normalizeWebSearchResults(results: WebSearchResultCandidate[]): NormalizedWebSearchResult[] {
+	return results
+		.map((r) => {
+			const url = (r.url ?? "").trim();
+			if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) return null;
+
+			const title = (r.title ?? "").trim() || url;
+			const rawSnippet =
+				(r.snippet ?? "").trim() ||
+				(r.highlights?.[0] ?? "").trim() ||
+				(r.text ?? "").trim();
+			const snippet = rawSnippet ? normalizeWhitespace(rawSnippet).slice(0, 400) : undefined;
+			const publishedAt = (r.publishedAt ?? r.publishedDate ?? "").trim() || undefined;
+
+			return {
+				title,
+				url,
+				snippet,
+				publishedAt,
+			} satisfies NormalizedWebSearchResult;
+		})
+		.filter(Boolean) as NormalizedWebSearchResult[];
+}
+
 export async function mapWithConcurrency<T, R>(
 	items: T[],
 	concurrency: number,

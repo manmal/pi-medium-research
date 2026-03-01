@@ -5,11 +5,16 @@ import {
 	buildMirrorUrls,
 	extractFreedium,
 	extractSnippetFromRssDescription,
+	extractRssFallbackTags,
 	isCacheFresh,
+	isWebSearchErrorRetryable,
 	mapWithConcurrency,
 	normalizeInputUrl,
+	normalizeWebSearchResults,
 	parseMirrorBases,
+	parseRssQuery,
 	retryAsync,
+	runWebSearchWithRssTagFallback,
 } from "../core.ts";
 
 test("test harness runs", () => {
@@ -140,6 +145,145 @@ test("extractFreedium extracts author from meta tag when present", () => {
 test("extractSnippetFromRssDescription falls back to plain text", () => {
 	const desc = `<p>First paragraph.</p><p>Second paragraph.</p>`;
 	assert.equal(extractSnippetFromRssDescription(desc), "First paragraph.");
+});
+
+test("parseRssQuery extracts tag syntax", () => {
+	assert.deepEqual(parseRssQuery("tag:technology"), { mode: "rss_tag", value: "technology" });
+});
+
+test("parseRssQuery extracts author syntax with @", () => {
+	assert.deepEqual(parseRssQuery("author:@towardsdatascience"), {
+		mode: "rss_author",
+		value: "towardsdatascience",
+	});
+});
+
+test("parseRssQuery extracts publication syntax", () => {
+	assert.deepEqual(parseRssQuery("pub:towards-data-science"), {
+		mode: "rss_publication",
+		value: "towards-data-science",
+	});
+});
+
+test("parseRssQuery returns undefined for free-form query", () => {
+	assert.equal(parseRssQuery("swift concurrency tutorials"), undefined);
+});
+
+test("normalizeWebSearchResults keeps valid urls and normalizes snippets", () => {
+	const normalized = normalizeWebSearchResults([
+		{
+			title: "Article A",
+			url: "https://medium.com/@x/a",
+			snippet: "  One   Two  ",
+			publishedDate: "2026-01-01",
+		},
+		{
+			title: "No URL",
+		},
+	]);
+
+	assert.deepEqual(normalized, [
+		{
+			title: "Article A",
+			url: "https://medium.com/@x/a",
+			snippet: "One Two",
+			publishedAt: "2026-01-01",
+		},
+	]);
+});
+
+test("normalizeWebSearchResults falls back to text/highlights", () => {
+	const normalized = normalizeWebSearchResults([
+		{
+			url: "https://medium.com/@x/b",
+			highlights: ["  Highlight   value  "],
+		},
+		{
+			url: "https://medium.com/@x/c",
+			text: "  Text   value  ",
+		},
+	]);
+
+	assert.deepEqual(normalized, [
+		{
+			title: "https://medium.com/@x/b",
+			url: "https://medium.com/@x/b",
+			snippet: "Highlight value",
+			publishedAt: undefined,
+		},
+		{
+			title: "https://medium.com/@x/c",
+			url: "https://medium.com/@x/c",
+			snippet: "Text value",
+			publishedAt: undefined,
+		},
+	]);
+});
+
+test("extractRssFallbackTags extracts stable tag candidates", () => {
+	assert.deepEqual(extractRssFallbackTags("swift concurrency site:medium.com"), ["swift", "concurrency"]);
+});
+
+test("extractRssFallbackTags de-duplicates tokens and respects limit", () => {
+	assert.deepEqual(
+		extractRssFallbackTags("swift swift charts medium.com charts tutorials", 2),
+		["swift", "charts"]
+	);
+});
+
+test("isWebSearchErrorRetryable identifies transient failures", () => {
+	assert.equal(isWebSearchErrorRetryable(new Error("Network error: fetch failed")), true);
+	assert.equal(isWebSearchErrorRetryable(new Error("Web search timed out after 25000ms")), true);
+	assert.equal(isWebSearchErrorRetryable(new Error("Perplexity API key not found")), false);
+});
+
+test("runWebSearchWithRssTagFallback returns web results when available", async () => {
+	let rssCalls = 0;
+	const result = await runWebSearchWithRssTagFallback({
+		query: "swift charts",
+		runWebSearch: async () => [{ source: "web" }],
+		runRssTagSearch: async () => {
+			rssCalls++;
+			return [{ source: "rss" }];
+		},
+	});
+
+	assert.deepEqual(result, [{ source: "web" }]);
+	assert.equal(rssCalls, 0);
+});
+
+test("runWebSearchWithRssTagFallback tries RSS tags when web search fails", async () => {
+	const triedTags: string[] = [];
+	const warnings: string[] = [];
+	const result = await runWebSearchWithRssTagFallback({
+		query: "swift charts",
+		runWebSearch: async () => {
+			throw new Error("No search provider available");
+		},
+		runRssTagSearch: async (tag) => {
+			triedTags.push(tag);
+			if (tag === "charts") return [{ source: "rss", tag }];
+			return [];
+		},
+		logWarn: (message) => warnings.push(message),
+	});
+
+	assert.deepEqual(triedTags, ["swift", "charts"]);
+	assert.deepEqual(result, [{ source: "rss", tag: "charts" }]);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /trying RSS tag fallback/i);
+});
+
+test("runWebSearchWithRssTagFallback returns empty when all fallbacks fail", async () => {
+	const result = await runWebSearchWithRssTagFallback({
+		query: "swift charts",
+		runWebSearch: async () => {
+			throw new Error("No search provider available");
+		},
+		runRssTagSearch: async () => [],
+	});
+
+	assert.deepEqual(result, []);
 });
 
 test("mapWithConcurrency preserves order and respects concurrency", async () => {

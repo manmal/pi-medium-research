@@ -2,12 +2,17 @@
 
 Location: `~/.pi/agent/extensions/medium-research/`
 
+## Upstream credit
+
+This fork is based on the original `pi-medium-research` project by Harmeet Randhawa:
+- https://github.com/Soorma718/pi-medium-research
+
 ## What it adds
 
 ### Tools (LLM-callable)
 - `medium_find` — find Medium articles
-  - **Best**: set `EXA_API_KEY` to enable high-quality search via Exa
-  - **Fallback (no API key required)**: RSS discovery via `tag:<tag>`, `author:<user>`, `pub:<publication>`
+  - **Free-form queries** use `pi-web-access` search
+  - **RSS discovery** is also supported via `tag:<tag>`, `author:<user>`, `pub:<publication>`
 - `medium_read` — fetch + extract an article via a **mirror** and return **text/markdown**
   - Default format is **text** (fast) unless overridden
 - `medium_research` — find + read N articles and return a bundle in `details` (reads concurrently)
@@ -31,22 +36,26 @@ npm install
 Reload pi resources:
 - In pi TUI: `/reload`
 
-## Configuration
+## Search behavior
 
-### Exa search (recommended)
+### Free-form search
 
-```bash
-export EXA_API_KEY="..."
-```
-
-Then you can do free-form queries like:
+Free-form queries like these:
 - `swiftui navigation performance`
 - `liquid glass site:medium.com`
 
-Without `EXA_API_KEY`, you must use RSS-backed discovery:
+use the bundled `pi-web-access` search integration.
+
+If free-form search is temporarily unavailable, the extension logs a short warning, tries RSS tag fallback inferred from your query, and then shows RSS syntax guidance if no fallback results are found.
+
+### RSS discovery (always available)
+
+You can always use RSS-backed discovery syntax:
 - `tag:technology`
 - `author:towardsdatascience`
 - `pub:towards-data-science`
+
+## Configuration
 
 ### Mirrors (reading)
 
@@ -92,6 +101,7 @@ export PI_MEDIUM_RESEARCH_CONCURRENCY="3"
 ```
 
 ## Notes / limitations
+- Search quality depends on the currently available `pi-web-access` backend/provider.
 - Mirrors are third-party services; availability can be intermittent.
 - Tool output is truncated to **50KB / 2000 lines**. When truncated, the full article is saved to a temp file and the path is included.
 - Cache file:
@@ -105,3 +115,7 @@ Run unit tests:
 cd ~/.pi/agent/extensions/medium-research
 npm test
 ```
+
+Continuous integration:
+- GitHub Actions workflow: `.github/workflows/ci.yml`
+- Runs `npm ci` + `npm test` on push to `main` and on pull requests (Node 20 and 22)

@@ -12,6 +12,7 @@ import { XMLParser } from "fast-xml-parser";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { search as webSearch } from "pi-web-access/gemini-search.ts";
 
 import {
 	buildMirrorUrls,
@@ -20,8 +21,12 @@ import {
 	isCacheFresh,
 	mapWithConcurrency,
 	normalizeInputUrl,
+	normalizeWebSearchResults,
 	parseMirrorBases,
+	parseRssQuery,
 	retryAsync,
+	runWebSearchWithRssTagFallback,
+	isWebSearchErrorRetryable,
 	type MediumReadFormat,
 } from "./core.ts";
 
@@ -31,7 +36,7 @@ const DEFAULT_CACHE_TTL_HOURS = 24;
 
 const USER_AGENT = "pi-medium-research/0.2";
 
-type MediumFindSource = "auto" | "exa" | "rss_tag" | "rss_author" | "rss_publication";
+type MediumFindSource = "auto" | "web" | "rss_tag" | "rss_author" | "rss_publication";
 
 interface ArticleRef {
 	source: MediumFindSource;
@@ -188,71 +193,49 @@ function writeFullTextTempFile(text: string): string {
 	return p;
 }
 
-async function exaSearch(
+async function webSearchArticles(
 	query: string,
-	options: { numResults: number; signal?: AbortSignal; includeHighlights?: boolean }
+	options: { numResults: number; signal?: AbortSignal }
 ): Promise<ArticleRef[]> {
-	const apiKey = process.env.EXA_API_KEY;
-	if (!apiKey) {
-		throw new Error(
-			"EXA_API_KEY is not set. Either set EXA_API_KEY or use RSS modes (source=rss_tag/rss_author/rss_publication)."
-		);
-	}
+	const q = query.includes("site:") ? query : `site:medium.com ${query}`;
 
-	const body: any = {
-		query,
-		numResults: options.numResults,
-		type: "auto",
-	};
-	if (options.includeHighlights) {
-		body.contents = { highlights: { max_characters: 600 } };
-	}
+	const runSearch = async (): Promise<ArticleRef[]> => {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+		const onAbort = () => controller.abort();
+		try {
+			options.signal?.addEventListener("abort", onAbort);
+			const response = await webSearch(q, {
+				numResults: options.numResults,
+				domainFilter: ["medium.com"],
+				signal: controller.signal,
+			});
 
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-	const onAbort = () => controller.abort();
-	try {
-		options.signal?.addEventListener("abort", onAbort);
-		const res = await fetch("https://api.exa.ai/search", {
-			method: "POST",
-			headers: {
-				"content-type": "application/json",
-				"x-api-key": apiKey,
-				"user-agent": USER_AGENT,
-			},
-			body: JSON.stringify(body),
-			signal: controller.signal,
-		});
-		if (!res.ok) {
-			const txt = await res.text().catch(() => "");
-			throw new Error(
-				`Exa search failed (HTTP ${res.status}). ${txt ? txt.slice(0, 400) : ""}`
+			const normalized = normalizeWebSearchResults(response.results ?? []);
+			return normalized.slice(0, options.numResults).map((r) => ({
+				source: "web" as const,
+				title: r.title,
+				url: r.url,
+				snippet: r.snippet,
+				publishedAt: r.publishedAt,
+			}));
+		} catch (e: any) {
+			const timedOut = controller.signal.aborted && !options.signal?.aborted;
+			const err: FetchError = new Error(
+				timedOut ? `Web search timed out after ${DEFAULT_TIMEOUT_MS}ms` : String(e?.message ?? e)
 			);
+			err.retryable = timedOut ? true : isWebSearchErrorRetryable(e);
+			throw err;
+		} finally {
+			clearTimeout(timeout);
+			options.signal?.removeEventListener("abort", onAbort);
 		}
-		const json = (await res.json()) as any;
-		const results = (json?.results ?? []) as any[];
-		return results
-			.map((r) => {
-				const url = r?.url as string | undefined;
-				if (!url) return null;
-				const title = (r?.title as string | undefined) ?? url;
-				const snippet =
-					(r?.highlights?.[0] as string | undefined) ??
-					(r?.text as string | undefined);
-				const publishedAt = r?.publishedDate as string | undefined;
-				return {
-					source: "exa" as const,
-					title,
-					url,
-					snippet: snippet?.trim() ? snippet.trim().slice(0, 400) : undefined,
-					publishedAt,
-				} satisfies ArticleRef;
-			})
-			.filter(Boolean) as ArticleRef[];
-	} finally {
-		clearTimeout(timeout);
-		options.signal?.removeEventListener("abort", onAbort);
-	}
+	};
+
+	return await retryAsync(runSearch, {
+		retries: 3,
+		shouldRetry: (e) => Boolean((e as any)?.retryable),
+	});
 }
 
 function parseMediumRss(xml: string, source: MediumFindSource): ArticleRef[] {
@@ -301,10 +284,9 @@ async function findArticles(params: {
 	limit: number;
 	signal?: AbortSignal;
 }): Promise<ArticleRef[]> {
-	if (params.source === "exa") {
-		if (!params.query) throw new Error("query is required for Exa search");
-		const q = params.query.includes("site:") ? params.query : `site:medium.com ${params.query}`;
-		return await exaSearch(q, { numResults: params.limit, signal: params.signal, includeHighlights: true });
+	if (params.source === "web") {
+		if (!params.query) throw new Error("query is required for web search");
+		return await webSearchArticles(params.query, { numResults: params.limit, signal: params.signal });
 	}
 
 	if (params.source === "rss_tag") {
@@ -335,36 +317,39 @@ async function findArticles(params: {
 
 	// auto
 	const q = (params.query ?? "").trim();
-	const tagMatch = q.match(/(?:^|\s)tag:([\w-]+)/i);
-	const authorMatch = q.match(/(?:^|\s)author:@?([\w-]+)/i);
-	const pubMatch = q.match(/(?:^|\s)pub:([\w-]+)/i);
+	const rssQuery = parseRssQuery(q);
 
-	if (tagMatch) {
-		return await findArticles({ source: "rss_tag", tag: tagMatch[1], limit: params.limit, signal: params.signal });
+	if (rssQuery?.mode === "rss_tag") {
+		return await findArticles({ source: "rss_tag", tag: rssQuery.value, limit: params.limit, signal: params.signal });
 	}
-	if (authorMatch) {
+	if (rssQuery?.mode === "rss_author") {
 		return await findArticles({
 			source: "rss_author",
-			author: authorMatch[1],
+			author: rssQuery.value,
 			limit: params.limit,
 			signal: params.signal,
 		});
 	}
-	if (pubMatch) {
+	if (rssQuery?.mode === "rss_publication") {
 		return await findArticles({
 			source: "rss_publication",
-			publication: pubMatch[1],
+			publication: rssQuery.value,
 			limit: params.limit,
 			signal: params.signal,
 		});
 	}
 
-	if (process.env.EXA_API_KEY) {
-		return await findArticles({ source: "exa", query: q, limit: params.limit, signal: params.signal });
-	}
+	const fallbackResults = await runWebSearchWithRssTagFallback<ArticleRef>({
+		query: q,
+		runWebSearch: async () => await findArticles({ source: "web", query: q, limit: params.limit, signal: params.signal }),
+		runRssTagSearch: async (tag) =>
+			await findArticles({ source: "rss_tag", tag, limit: params.limit, signal: params.signal }),
+		logWarn: (message) => console.warn(message),
+	});
+	if (fallbackResults.length > 0) return fallbackResults;
 
 	throw new Error(
-		"No search backend available for a free-form query. Either set EXA_API_KEY (recommended) or use one of: tag:<tag>, author:<username>, pub:<publication>."
+		"Free-form search is unavailable and RSS tag fallback found no results. Use one of: tag:<tag>, author:<username>, pub:<publication>."
 	);
 }
 
@@ -431,7 +416,7 @@ const MediumFindParams = Type.Object({
 	query: Type.Optional(Type.String({ description: "Search query. For RSS mode you can omit and use tag/author/pub instead." })),
 	limit: Type.Optional(Type.Integer({ description: "Max results (default: 10)", minimum: 1, maximum: 50 })),
 	source: Type.Optional(
-		StringEnum(["auto", "exa", "rss_tag", "rss_author", "rss_publication"] as const, {
+		StringEnum(["auto", "web", "rss_tag", "rss_author", "rss_publication"] as const, {
 			description: "Search backend (default: auto).",
 		})
 	),
@@ -462,7 +447,7 @@ export default function (pi: ExtensionAPI) {
 		name: "medium_find",
 		label: "Medium Find",
 		description:
-			"Find Medium articles. Uses Exa if EXA_API_KEY is set (recommended). Otherwise supports RSS modes: tag:<tag>, author:<username>, pub:<publication>.",
+			"Find Medium articles. Free-form queries use pi-web-access search. RSS modes are also supported: tag:<tag>, author:<username>, pub:<publication>.",
 		parameters: MediumFindParams,
 		async execute(_toolCallId, params, signal) {
 			const limit = params.limit ?? 10;
@@ -591,7 +576,7 @@ export default function (pi: ExtensionAPI) {
 	// Command: /medium
 	pi.registerCommand("medium", {
 		description:
-			"Interactive Medium search + read. Uses EXA_API_KEY if set, otherwise requires tag:/author:/pub: syntax.",
+			"Interactive Medium search + read. Free-form uses pi-web-access search; RSS syntax also works (tag:/author:/pub:).",
 		handler: async (args, ctx) => {
 			const query = args?.trim() || (await ctx.ui.input("Medium query", "e.g. tag:technology or embeddings"));
 			if (!query) return;
@@ -661,7 +646,7 @@ export default function (pi: ExtensionAPI) {
 	// Command: /mfind (fast path, bypasses LLM)
 	pi.registerCommand("mfind", {
 		description:
-			"Find Medium articles quickly. Usage: /mfind <query>. Without EXA_API_KEY use tag:/author:/pub: syntax.",
+			"Find Medium articles quickly. Usage: /mfind <query>. Free-form uses pi-web-access search; RSS syntax also works (tag:/author:/pub:).",
 		handler: async (args, ctx) => {
 			let query = (args ?? "").trim();
 			if (!query) query = (await ctx.ui.input("Medium query", "e.g. tag:technology or embeddings")) ?? "";
